@@ -52,3 +52,11 @@ I guess we'll have to continually update it.
 But that's no different than using people's APIs, because companies all seem to
 be deprecating and changing their APIs regularly too.
 
+Reliability notes
+--------
+
+- On runtime failures, the tool captures `/error.png` and `/error.html` in your
+  download directory to help debugging. These files are overwritten on each new
+  failure.
+- If sync stops making progress for an extended period, the tool now exits with
+  an explicit sync-stalled error instead of crashing.

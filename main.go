@@ -92,6 +92,7 @@ var errAlreadyDownloaded = errors.New("photo already downloaded")
 var errAbortBatch = errors.New("abort batch")
 var errNavigateAborted = errors.New("navigate aborted")
 var errUnexpectedDownload = errors.New("unexpected download")
+var errSyncStalled = errors.New("sync stalled")
 var fromDate time.Time
 var toDate time.Time
 var loc GPhotosLocale
@@ -122,6 +123,9 @@ func main() {
 	}
 	if *albumIdFlag != "" && (*fromFlag != "" || *toFlag != "") {
 		log.Fatal().Msg("-from and -to cannot be used with -album")
+	}
+	if *workersFlag < 1 {
+		log.Fatal().Msg("-workers must be >= 1")
 	}
 
 	// Set XDG_CONFIG_HOME and XDG_CACHE_HOME to a temp dir to solve issue in newer versions of Chromium
@@ -164,7 +168,15 @@ func main() {
 		log.Fatal().Msgf("failed to clean download directory %v: %v", s.downloadDir, err)
 	}
 
-	ctx, cancel := s.NewWindow()
+	if err := initLocales(); err != nil {
+		log.Fatal().Msgf("failed to initialize locales: %v", err)
+	}
+	loc = locales["en"]
+
+	ctx, cancel, err := s.NewWindow()
+	if err != nil {
+		log.Fatal().Msgf("failed to start browser window: %v", err)
+	}
 	defer cancel()
 
 	startupCtx, startupCancel := context.WithTimeout(ctx, 10*time.Minute)
@@ -179,7 +191,6 @@ func main() {
 		log.Fatal().Msgf("failed to get locale: %v", err)
 	}
 
-	initLocales()
 	_loc, exists := locales[locale]
 	if !exists {
 		log.Warn().Msgf("your Google account is using unsupported locale %s, this is likely to cause issues. Please change account language to English (en) or another supported locale", locale)
@@ -229,7 +240,6 @@ type Session struct {
 	downloadDirTmp   string // dir where the photos get stored temporarily
 	profileDir       string // user data session dir. automatically created on chrome startup.
 	startNodeParent  *cdp.Node
-	globalErrChan    chan error
 	userPath         string
 	albumPath        string
 	existingItems    sync.Map
@@ -305,7 +315,6 @@ func NewSession() (*Session, error) {
 		profileDir:      dir,
 		downloadDir:     downloadDir,
 		downloadDirTmp:  downloadDirTmp,
-		globalErrChan:   make(chan error, 1),
 		userPath:        userPath,
 		albumPath:       albumPath,
 		newDownloadChan: make(chan NewDownload),
@@ -320,7 +329,7 @@ func NewSession() (*Session, error) {
 	return s, nil
 }
 
-func (s *Session) NewWindow() (context.Context, context.CancelFunc) {
+func (s *Session) NewWindow() (context.Context, context.CancelFunc, error) {
 	log.Info().Msgf("starting Chrome browser")
 
 	// Let's use as a base for allocator options (It implies Headless)
@@ -373,16 +382,19 @@ func (s *Session) NewWindow() (context.Context, context.CancelFunc) {
 			return nil
 		}),
 	); err != nil {
-		panic(err)
+		cancel()
+		return nil, nil, fmt.Errorf("browser setup failed: %w", err)
 	}
 
 	startDownloadListener(ctx, s.newDownloadChan)
 
-	return ctx, cancel
+	return ctx, cancel, nil
 }
 
 func (s *Session) Shutdown() {
-	s.chromeExecCancel()
+	if s.chromeExecCancel != nil {
+		s.chromeExecCancel()
+	}
 }
 
 func (s *Session) cdpLog(format string, v ...any) {
@@ -483,7 +495,7 @@ func (s *Session) login(ctx context.Context) error {
 				}
 				if strings.Contains(location, "signin/speedbump/passkeyenrollment") && loc.NotNow != "" {
 					// skip passkey enrollment, press "Not now" button
-					if err := chromedp.Click(`//button//span[contains(text(), loc.NotNow)]`, chromedp.BySearch).Do(ctx); err != nil {
+					if err := chromedp.Click(fmt.Sprintf(`//button//span[contains(text(), %q)]`, loc.NotNow), chromedp.BySearch).Do(ctx); err != nil {
 						return err
 					}
 					time.Sleep(tick)
@@ -1226,9 +1238,13 @@ func (*Session) checkForStillProcessing(ctx context.Context) error {
 
 	// This text is available before attempting to download, but doesn't show immediately when the page is loaded
 	var undownloadable bool
-	chromedp.Evaluate(`function () {
-		return [...document.querySelectorAll('c-wiz[data-media-key*="document.location.href.trim().split('/').pop()"]')].filter(x => getComputedStyle(x).visibility != 'hidden')[0]?.textContent.indexOf('Your video will be ready soon') >= 0
-	}`, &undownloadable).Do(ctx)
+	if err := chromedp.Evaluate(`(function () {
+		const imageId = document.location.href.trim().split('/').pop();
+		const nodes = [...document.querySelectorAll('c-wiz[data-media-key*="' + imageId + '"]')].filter(x => getComputedStyle(x).visibility != 'hidden');
+		return (nodes[0]?.textContent || '').indexOf('Your video will be ready soon') >= 0;
+	})()`, &undownloadable).Do(ctx); err != nil {
+		return err
+	}
 
 	if undownloadable {
 		return errStillProcessing
@@ -1702,6 +1718,8 @@ func (s *Session) resync(ctx context.Context) error {
 	jobChan := make(chan Job)
 	resultChan := make(chan string, *workersFlag)
 	errChan := make(chan error, *workersFlag)
+	globalErrChan := make(chan error, 1)
+	stallErrChan := make(chan error, 1)
 	var runningWorkers atomic.Int64
 	runningWorkers.Store(*workersFlag)
 	var workerDownloadChanByFrameId sync.Map
@@ -1710,21 +1728,36 @@ func (s *Session) resync(ctx context.Context) error {
 		workerDownloadChanByFrameId.Store(s.downloadWorker(int(i+1), jobChan, resultChan, errChan, workerDownloadChan), workerDownloadChan)
 	}
 
-	// job channel routing
+	// Single owner of globalErrChan: routes worker/progress errors and closes the channel.
 	go func(ctx context.Context) {
+		defer close(globalErrChan)
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case err := <-stallErrChan:
+				if err != nil {
+					select {
+					case globalErrChan <- err:
+					case <-ctx.Done():
+					}
+				}
+				return
 			case newDownload := <-s.newDownloadChan:
 				worker, exists := workerDownloadChanByFrameId.Load(newDownload.targetId)
 				if !exists {
-					s.globalErrChan <- fmt.Errorf("worker with targetId %s not found for download of %s", newDownload.targetId, newDownload.suggestedFilename)
+					select {
+					case globalErrChan <- fmt.Errorf("worker with targetId %s not found for download of %s", newDownload.targetId, newDownload.suggestedFilename):
+					case <-ctx.Done():
+					}
 					return
 				}
-				go func() {
-					worker.(chan NewDownload) <- newDownload
-				}()
+				go func(worker chan NewDownload, newDownload NewDownload) {
+					select {
+					case worker <- newDownload:
+					case <-ctx.Done():
+					}
+				}(worker.(chan NewDownload), newDownload)
 			case res := <-resultChan:
 				if res != "" {
 					if _, exists := s.downloadedItems.Load(res); exists {
@@ -1738,10 +1771,13 @@ func (s *Session) resync(ctx context.Context) error {
 			case err := <-errChan:
 				if err != nil {
 					log.Trace().Msgf("received error from worker: %s", err.Error())
-					s.globalErrChan <- err
+					select {
+					case globalErrChan <- err:
+					case <-ctx.Done():
+					}
+					return
 				}
 				if runningWorkers.Add(-1) == 0 {
-					s.globalErrChan <- nil
 					return
 				}
 			}
@@ -1779,7 +1815,11 @@ func (s *Session) resync(ctx context.Context) error {
 			if syncedCount == lastSyncedCount {
 				iterationsWithNoProgressCount++
 				if iterationsWithNoProgressCount > 20 {
-					panic("no new items processed for 20 minutes, stopping sync")
+					select {
+					case stallErrChan <- fmt.Errorf("%w: no new items processed for 20 minutes", errSyncStalled):
+					default:
+					}
+					return
 				}
 			} else {
 				iterationsWithNoProgressCount = 0
@@ -1825,7 +1865,10 @@ syncAllLoop:
 		log.Trace().Msgf("slider position: %.2f%%", sliderPos*100)
 
 		select {
-		case err := <-s.globalErrChan:
+		case err, ok := <-globalErrChan:
+			if !ok || err == nil {
+				return nil
+			}
 			if errors.Is(err, errPhotoTakenBeforeFromDate) {
 				log.Info().Msg("found photo taken before -from date, stopping sync here")
 				break syncAllLoop
@@ -1916,7 +1959,10 @@ syncAllLoop:
 			log.Trace().Msgf("queuing job with itemIds: %s", strings.Join(job.imageIds, ", "))
 
 			select {
-			case err := <-s.globalErrChan:
+			case err, ok := <-globalErrChan:
+				if !ok || err == nil {
+					return nil
+				}
 				if errors.Is(err, errPhotoTakenBeforeFromDate) {
 					log.Info().Msg("found photo taken before -from date, stopping sync here")
 					break syncAllLoop
@@ -1935,7 +1981,7 @@ syncAllLoop:
 	}
 	close(jobChan)
 
-	for err := range s.globalErrChan {
+	for err := range globalErrChan {
 		if !errors.Is(err, errPhotoTakenBeforeFromDate) {
 			return err
 		}
@@ -2173,6 +2219,7 @@ func setFileDate(filepath string, date time.Time) error {
 
 func startDownloadListener(ctx context.Context, newDownloadChan chan NewDownload) {
 	currentDownloads := make(map[string]chan bool)
+	var currentDownloadsMu sync.Mutex
 
 	// Listen for new download events
 	chromedp.ListenBrowser(ctx, func(v interface{}) {
@@ -2181,11 +2228,17 @@ func startDownloadListener(ctx context.Context, newDownloadChan chan NewDownload
 			if ev.SuggestedFilename == "downloads.html" {
 				return
 			}
+			currentDownloadsMu.Lock()
 			if _, exists := currentDownloads[ev.GUID]; !exists {
-				currentDownloads[ev.GUID] = make(chan bool)
+				currentDownloads[ev.GUID] = make(chan bool, 2)
 			}
+			progressChan := currentDownloads[ev.GUID]
+			currentDownloadsMu.Unlock()
 			go func() {
-				newDownloadChan <- NewDownload{ev.GUID, ev.SuggestedFilename, ev.FrameID.String(), currentDownloads[ev.GUID]}
+				select {
+				case newDownloadChan <- NewDownload{ev.GUID, ev.SuggestedFilename, ev.FrameID.String(), progressChan}:
+				case <-ctx.Done():
+				}
 			}()
 		}
 	})
@@ -2193,20 +2246,30 @@ func startDownloadListener(ctx context.Context, newDownloadChan chan NewDownload
 	// Listen for download progress events
 	chromedp.ListenBrowser(ctx, func(v interface{}) {
 		if ev, ok := v.(*browser.EventDownloadProgress); ok {
+			currentDownloadsMu.Lock()
+			progressChan, exists := currentDownloads[ev.GUID]
+			if ev.State == browser.DownloadProgressStateCompleted && exists {
+				delete(currentDownloads, ev.GUID)
+			}
+			currentDownloadsMu.Unlock()
+
+			if !exists {
+				log.Trace().Str("GUID", ev.GUID).Msg("received progress event for unknown download GUID")
+				return
+			}
+
 			if ev.State == browser.DownloadProgressStateInProgress {
 				select {
-				case currentDownloads[ev.GUID] <- false:
+				case progressChan <- false:
 				default:
 				}
 			}
 			if ev.State == browser.DownloadProgressStateCompleted {
 				log.Trace().Str("GUID", ev.GUID).Msgf("received download completed event")
-				progressChan := currentDownloads[ev.GUID]
-				delete(currentDownloads, ev.GUID)
-				go func() {
-					time.Sleep(1 * time.Millisecond)
-					progressChan <- true
-				}()
+				select {
+				case progressChan <- true:
+				default:
+				}
 			}
 		}
 	})
