@@ -146,10 +146,10 @@ func main() {
 	if *toFlag != "" {
 		var err error
 		toDate, err = time.Parse(time.DateOnly, *toFlag)
-		toDate = toDate.Add(time.Hour * 24)
 		if err != nil {
 			log.Fatal().Msgf("could not parse -to argument %s, must be YYYY-MM-DD", *toFlag)
 		}
+		toDate = toDate.Add(time.Hour * 24)
 	}
 
 	s, err := NewSession()
@@ -179,7 +179,9 @@ func main() {
 		log.Fatal().Msgf("failed to get locale: %v", err)
 	}
 
-	initLocales()
+	if err := initLocales(); err != nil {
+		log.Fatal().Msgf("failed to initialize locales: %v", err)
+	}
 	_loc, exists := locales[locale]
 	if !exists {
 		log.Warn().Msgf("your Google account is using unsupported locale %s, this is likely to cause issues. Please change account language to English (en) or another supported locale", locale)
@@ -1174,8 +1176,11 @@ func (s *Session) startDownload(ctx context.Context, log zerolog.Logger, imageId
 	start := time.Now()
 
 	timeoutTimer := time.NewTimer(120 * time.Second)
+	defer timeoutTimer.Stop()
 	refreshTimer := time.NewTimer(120 * time.Second)
+	defer refreshTimer.Stop()
 	requestTimer := time.NewTimer(0 * time.Second)
+	defer requestTimer.Stop()
 
 	log.Trace().Msgf("requesting download from tab %s", chromedp.FromContext(ctx).Target.TargetID)
 
@@ -1193,14 +1198,17 @@ func (s *Session) startDownload(ctx context.Context, log zerolog.Logger, imageId
 				} else if !isOriginal {
 					requestDownloadBackup(ctx, log)
 				}
+				refreshTimer.Stop()
 				refreshTimer = time.NewTimer(100 * time.Millisecond)
 			} else {
+				refreshTimer.Stop()
 				refreshTimer = time.NewTimer(5 * time.Second)
 			}
 		case <-refreshTimer.C:
 			log.Debug().Msgf("reloading page because download failed to start")
 			if err := s.navigateToPhoto(ctx, log, imageId); err != nil {
 				log.Error().Msgf("startDownload: %s", err.Error())
+				refreshTimer.Stop()
 				refreshTimer = time.NewTimer(1 * time.Second)
 			} else {
 				requestTimer = time.NewTimer(100 * time.Millisecond)
@@ -1410,7 +1418,7 @@ func (s *Session) downloadAndProcessItem(ctx context.Context, log zerolog.Logger
 	defer cancel()
 
 	photoDataChan := make(chan PhotoData, 2)
-	errChan := make(chan error)
+	errChan := make(chan error, 4)
 	jobsRemaining := 3
 
 	go func() {
@@ -1776,7 +1784,8 @@ func (s *Session) resync(ctx context.Context) error {
 			if syncedCount == lastSyncedCount {
 				iterationsWithNoProgressCount++
 				if iterationsWithNoProgressCount > 20 {
-					panic("no new items processed for 20 minutes, stopping sync")
+					s.globalErrChan <- fmt.Errorf("no new items processed for 20 minutes, stopping sync")
+					return
 				}
 			} else {
 				iterationsWithNoProgressCount = 0
