@@ -67,7 +67,7 @@ var (
 	fromFlag        = flag.String("from", "", "earliest date to sync (YYYY-MM-DD)")
 	toFlag          = flag.String("to", "", "latest date to sync (YYYY-MM-DD)")
 	untilFlag       = flag.String("until", "", "stop syncing at this photo")
-	runFlag         = flag.String("run", "", "the program to run on each downloaded item, right after it is dowloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
+	runFlag         = flag.String("run", "", "the program to run on each downloaded item, right after it is downloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
 	verboseFlag     = flag.Bool("v", false, "be verbose")
 	headlessFlag    = flag.Bool("headless", false, "Start chrome browser in headless mode (must use -dev and have already authenticated).")
 	jsonLogFlag     = flag.Bool("json", false, "output logs in JSON format")
@@ -492,14 +492,14 @@ func (s *Session) login(ctx context.Context) error {
 				var nodes []*cdp.Node
 				email := os.Getenv("GPHOTOS_EMAIL")
 				if email != "" {
-					email_node := "#identifierId:not([type=hidden])"
-					log.Debug().Msgf("checking for email node: %s", email_node)
-					if err := chromedp.Nodes(email_node, &nodes, chromedp.ByQuery, chromedp.AtLeast(0)).Do(ctx); err != nil {
+					emailNode := "#identifierId:not([type=hidden])"
+					log.Debug().Msgf("checking for email node: %s", emailNode)
+					if err := chromedp.Nodes(emailNode, &nodes, chromedp.ByQuery, chromedp.AtLeast(0)).Do(ctx); err != nil {
 						return err
 					}
 					if len(nodes) > 0 {
 						log.Info().Msgf("logging in with user email: %s", email)
-						if err := chromedp.SendKeys(email_node, email+kb.Enter).Do(ctx); err != nil {
+						if err := chromedp.SendKeys(emailNode, email+kb.Enter).Do(ctx); err != nil {
 							return err
 						}
 						time.Sleep(tick)
@@ -508,14 +508,14 @@ func (s *Session) login(ctx context.Context) error {
 				}
 				password := os.Getenv("GPHOTOS_PASSWORD")
 				if password != "" {
-					password_node := "input[name=Passwd]"
-					log.Debug().Msgf("checking for password node: %s", password_node)
-					if err := chromedp.Nodes(password_node, &nodes, chromedp.ByQuery, chromedp.AtLeast(0)).Do(ctx); err != nil {
+					passwordNode := "input[name=Passwd]"
+					log.Debug().Msgf("checking for password node: %s", passwordNode)
+					if err := chromedp.Nodes(passwordNode, &nodes, chromedp.ByQuery, chromedp.AtLeast(0)).Do(ctx); err != nil {
 						return err
 					}
 					if len(nodes) > 0 {
 						log.Info().Msgf("logging in with user password")
-						if err := chromedp.SendKeys(password_node, password+kb.Enter).Do(ctx); err != nil {
+						if err := chromedp.SendKeys(passwordNode, password+kb.Enter).Do(ctx); err != nil {
 							return err
 						}
 						time.Sleep(tick * time.Duration(3))
@@ -995,7 +995,7 @@ func requestDownload(ctx context.Context, log zerolog.Logger, original bool, has
 		} else if errors.Is(err, errCouldNotPressDownloadButton) || errors.Is(err, context.DeadlineExceeded) {
 			log.Debug().Msgf("trying to request download again after error: %v", err)
 		} else {
-			return fmt.Errorf("encountered error '%s' when requesting download", err.Error())
+			return fmt.Errorf("encountered error when requesting download: %w", err)
 		}
 
 		time.Sleep(1 * time.Millisecond)
@@ -1554,7 +1554,7 @@ func (s *Session) handleZip(log zerolog.Logger, zipfile, outFolder string) ([]st
 
 var muTabActivity sync.Mutex = sync.Mutex{}
 
-type ContextLocks = struct {
+type ContextLocks struct {
 	muNavWaiting             sync.RWMutex
 	muKbEvents               sync.Mutex
 	listenEvents, navWaiting bool
@@ -1611,13 +1611,15 @@ func listenNavEvents(ctx context.Context) {
 	})
 }
 
-func setScrollPosition(ctx context.Context, pos float64) error {
-	var mainSel string
+func getMainSelector() string {
 	if len(*albumIdFlag) > 1 {
-		mainSel = `c-wiz c-wiz c-wiz`
-	} else {
-		mainSel = `[role="main"]`
+		return `c-wiz c-wiz c-wiz`
 	}
+	return `[role="main"]`
+}
+
+func setScrollPosition(ctx context.Context, pos float64) error {
+	mainSel := getMainSelector()
 
 	if err := chromedp.Evaluate(fmt.Sprintf(`
 		(function() {
@@ -1632,12 +1634,7 @@ func setScrollPosition(ctx context.Context, pos float64) error {
 }
 
 func getScrollPosition(ctx context.Context, sliderPos *float64) error {
-	var mainSel string
-	if len(*albumIdFlag) > 1 {
-		mainSel = `c-wiz c-wiz c-wiz`
-	} else {
-		mainSel = `[role="main"]`
-	}
+	mainSel := getMainSelector()
 
 	var err error
 	for range 3 {
@@ -1814,12 +1811,12 @@ syncAllLoop:
 		if scrollErr := getScrollPosition(ctx, &sliderPos); scrollErr != nil {
 			// sometimes chromedp gets into a bad state here, so let's restart navigation and try again
 			if err := s.navigateWithAction(ctx, log.Logger, chromedp.Navigate(gphotosUrl+s.userPath+s.albumPath), "to start", 20000*time.Millisecond, 5); err != nil {
-				return fmt.Errorf("error getting slider position, %w, followed by error when attempting to recover, %v", scrollErr, err)
+				return fmt.Errorf("error getting slider position, %w, followed by error when attempting to recover, %w", scrollErr, err)
 			}
 			chromedp.WaitReady("body", chromedp.ByQuery).Do(ctx)
 			if err := setScrollPosition(ctx, sliderPos); err != nil {
 				captureScreenshot(ctx, filepath.Join(s.downloadDir, "error"))
-				return fmt.Errorf("error getting slider position, %w, followed by error when attempting to recover, %v", scrollErr, err)
+				return fmt.Errorf("error getting slider position, %w, followed by error when attempting to recover, %w", scrollErr, err)
 			}
 		}
 		log.Trace().Msgf("slider position: %.2f%%", sliderPos*100)

@@ -130,15 +130,19 @@ func initLocales() error {
 }
 
 func getAriaLabelSelector(matcher NodeLabelMatch) string {
-	eq := "="
-	if matcher.MatchType == "equals" {
-		eq = "="
-	} else if matcher.MatchType == "startsWith" {
+	var eq string
+	switch matcher.MatchType {
+	case "startsWith":
 		eq = "^="
-	} else if matcher.MatchType == "contains" {
+	case "contains":
 		eq = "*="
-	} else if matcher.MatchType == "endsWith" {
+	case "endsWith":
 		eq = "$="
+	case "equals":
+		eq = "="
+	default:
+		log.Warn().Msgf("unknown match type %q, defaulting to equals", matcher.MatchType)
+		eq = "="
 	}
 	return fmt.Sprintf("[aria-label%s\"%s\"]", eq, matcher.MatchValue)
 }
