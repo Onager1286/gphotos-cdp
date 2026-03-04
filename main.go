@@ -485,7 +485,7 @@ func (s *Session) login(ctx context.Context) error {
 				}
 				if strings.Contains(location, "signin/speedbump/passkeyenrollment") && loc.NotNow != "" {
 					// skip passkey enrollment, press "Not now" button
-					if err := chromedp.Click(`//button//span[contains(text(), loc.NotNow)]`, chromedp.BySearch).Do(ctx); err != nil {
+					if err := chromedp.Click(`//button//span[contains(text(), "`+loc.NotNow+`")]`, chromedp.BySearch).Do(ctx); err != nil {
 						return err
 					}
 					time.Sleep(tick)
@@ -1234,9 +1234,7 @@ func (*Session) checkForStillProcessing(ctx context.Context) error {
 
 	// This text is available before attempting to download, but doesn't show immediately when the page is loaded
 	var undownloadable bool
-	chromedp.Evaluate(`function () {
-		return [...document.querySelectorAll('c-wiz[data-media-key*="document.location.href.trim().split('/').pop()"]')].filter(x => getComputedStyle(x).visibility != 'hidden')[0]?.textContent.indexOf('Your video will be ready soon') >= 0
-	}`, &undownloadable).Do(ctx)
+	chromedp.Evaluate(`[...document.querySelectorAll('c-wiz[data-media-key*="'+document.location.href.trim().split('/').pop()+'"]')].filter(x => getComputedStyle(x).visibility != 'hidden')[0]?.textContent.indexOf('Your video will be ready soon') >= 0`, &undownloadable).Do(ctx)
 
 	if undownloadable {
 		return errStillProcessing
@@ -2178,6 +2176,7 @@ func setFileDate(filepath string, date time.Time) error {
 }
 
 func startDownloadListener(ctx context.Context, newDownloadChan chan NewDownload) {
+	var mu sync.Mutex
 	currentDownloads := make(map[string]chan bool)
 
 	// Listen for new download events
@@ -2187,11 +2186,14 @@ func startDownloadListener(ctx context.Context, newDownloadChan chan NewDownload
 			if ev.SuggestedFilename == "downloads.html" {
 				return
 			}
+			mu.Lock()
 			if _, exists := currentDownloads[ev.GUID]; !exists {
 				currentDownloads[ev.GUID] = make(chan bool)
 			}
+			progressChan := currentDownloads[ev.GUID]
+			mu.Unlock()
 			go func() {
-				newDownloadChan <- NewDownload{ev.GUID, ev.SuggestedFilename, ev.FrameID.String(), currentDownloads[ev.GUID]}
+				newDownloadChan <- NewDownload{ev.GUID, ev.SuggestedFilename, ev.FrameID.String(), progressChan}
 			}()
 		}
 	})
@@ -2200,15 +2202,22 @@ func startDownloadListener(ctx context.Context, newDownloadChan chan NewDownload
 	chromedp.ListenBrowser(ctx, func(v interface{}) {
 		if ev, ok := v.(*browser.EventDownloadProgress); ok {
 			if ev.State == browser.DownloadProgressStateInProgress {
-				select {
-				case currentDownloads[ev.GUID] <- false:
-				default:
+				mu.Lock()
+				ch := currentDownloads[ev.GUID]
+				mu.Unlock()
+				if ch != nil {
+					select {
+					case ch <- false:
+					default:
+					}
 				}
 			}
 			if ev.State == browser.DownloadProgressStateCompleted {
 				log.Trace().Str("GUID", ev.GUID).Msgf("received download completed event")
+				mu.Lock()
 				progressChan := currentDownloads[ev.GUID]
 				delete(currentDownloads, ev.GUID)
+				mu.Unlock()
 				go func() {
 					time.Sleep(1 * time.Millisecond)
 					progressChan <- true
